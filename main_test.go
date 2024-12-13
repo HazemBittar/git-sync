@@ -23,155 +23,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"go.uber.org/goleak"
 )
-
-const (
-	testKey = "KEY"
-)
-
-func TestEnvBool(t *testing.T) {
-	cases := []struct {
-		value string
-		def   bool
-		exp   bool
-		err   bool
-	}{
-		{"true", true, true, false},
-		{"true", false, true, false},
-		{"", true, true, false},
-		{"", false, false, false},
-		{"false", true, false, false},
-		{"false", false, false, false},
-		{"", true, true, false},
-		{"", false, false, false},
-		{"no true", false, false, true},
-		{"no false", false, false, true},
-	}
-
-	for _, testCase := range cases {
-		os.Setenv(testKey, testCase.value)
-		val, err := envBoolOrError(testCase.def, testKey)
-		if err != nil && !testCase.err {
-			t.Fatalf("%q: unexpected error: %v", testCase.value, err)
-		}
-		if err == nil && testCase.err {
-			t.Fatalf("%q: unexpected success", testCase.value)
-		}
-		if val != testCase.exp {
-			t.Fatalf("%q: expected %v but %v returned", testCase.value, testCase.exp, val)
-		}
-	}
-}
-
-func TestEnvString(t *testing.T) {
-	cases := []struct {
-		value string
-		def   string
-		exp   string
-	}{
-		{"true", "true", "true"},
-		{"true", "false", "true"},
-		{"", "true", "true"},
-		{"", "false", "false"},
-		{"false", "true", "false"},
-		{"false", "false", "false"},
-		{"", "true", "true"},
-		{"", "false", "false"},
-	}
-
-	for _, testCase := range cases {
-		os.Setenv(testKey, testCase.value)
-		val := envString(testCase.def, testKey)
-		if val != testCase.exp {
-			t.Fatalf("%q: expected %v but %v returned", testCase.value, testCase.exp, val)
-		}
-	}
-}
-
-func TestEnvInt(t *testing.T) {
-	cases := []struct {
-		value string
-		def   int
-		exp   int
-		err   bool
-	}{
-		{"0", 1, 0, false},
-		{"", 0, 0, false},
-		{"-1", 0, -1, false},
-		{"abcd", 0, 0, true},
-		{"abcd", 0, 0, true},
-	}
-
-	for _, testCase := range cases {
-		os.Setenv(testKey, testCase.value)
-		val, err := envIntOrError(testCase.def, testKey)
-		if err != nil && !testCase.err {
-			t.Fatalf("%q: unexpected error: %v", testCase.value, err)
-		}
-		if err == nil && testCase.err {
-			t.Fatalf("%q: unexpected success", testCase.value)
-		}
-		if val != testCase.exp {
-			t.Fatalf("%q: expected %v but %v returned", testCase.value, testCase.exp, val)
-		}
-	}
-}
-
-func TestEnvFloat(t *testing.T) {
-	cases := []struct {
-		value string
-		def   float64
-		exp   float64
-		err   bool
-	}{
-		{"0.5", 0, 0.5, false},
-		{"", 0.5, 0.5, false},
-		{"-0.5", 0, -0.5, false},
-		{"abcd", 0, 0, true},
-	}
-
-	for _, testCase := range cases {
-		os.Setenv(testKey, testCase.value)
-		val, err := envFloatOrError(testCase.def, testKey)
-		if err != nil && !testCase.err {
-			t.Fatalf("%q: unexpected error: %v", testCase.value, err)
-		}
-		if err == nil && testCase.err {
-			t.Fatalf("%q: unexpected success", testCase.value)
-		}
-		if val != testCase.exp {
-			t.Fatalf("%q: expected %v but %v returned", testCase.value, testCase.exp, val)
-		}
-	}
-}
-
-func TestEnvDuration(t *testing.T) {
-	cases := []struct {
-		value string
-		def   time.Duration
-		exp   time.Duration
-		err   bool
-	}{
-		{"1s", 0, time.Second, false},
-		{"", time.Minute, time.Minute, false},
-		{"1h", 0, time.Hour, false},
-		{"abcd", 0, 0, true},
-	}
-
-	for _, testCase := range cases {
-		os.Setenv(testKey, testCase.value)
-		val, err := envDurationOrError(testCase.def, testKey)
-		if err != nil && !testCase.err {
-			t.Fatalf("%q: unexpected error: %v", testCase.value, err)
-		}
-		if err == nil && testCase.err {
-			t.Fatalf("%q: unexpected success", testCase.value)
-		}
-		if val != testCase.exp {
-			t.Fatalf("%q: expected %v but %v returned", testCase.value, testCase.exp, val)
-		}
-	}
-}
 
 func TestMakeAbsPath(t *testing.T) {
 	cases := []struct {
@@ -378,6 +232,8 @@ func TestParseGitConfigs(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			defer goleak.VerifyNone(t)
+
 			kvs, err := parseGitConfigs(tc.input)
 			if err != nil && !tc.fail {
 				t.Errorf("unexpected error: %v", err)
@@ -389,218 +245,6 @@ func TestParseGitConfigs(t *testing.T) {
 				t.Errorf("bad result:\n\texpected: %#v\n\t     got: %#v", tc.expect, kvs)
 			}
 		})
-	}
-}
-
-func TestAbsPathString(t *testing.T) {
-	testCases := []string{
-		"",
-		"/",
-		"//",
-		"/dir",
-		"/dir/",
-		"/dir//",
-		"/dir/sub",
-		"/dir/sub/",
-		"/dir//sub",
-		"/dir//sub/",
-		"dir",
-		"dir/sub",
-	}
-
-	for _, tc := range testCases {
-		if want, got := tc, absPath(tc).String(); want != got {
-			t.Errorf("expected %q, got %q", want, got)
-		}
-	}
-}
-
-func TestAbsPathCanonical(t *testing.T) {
-	testCases := []struct {
-		in  absPath
-		exp absPath
-	}{{
-		in:  "",
-		exp: "",
-	}, {
-		in:  "/",
-		exp: "/",
-	}, {
-		in:  "/one",
-		exp: "/one",
-	}, {
-		in:  "/one/two",
-		exp: "/one/two",
-	}, {
-		in:  "/one/two/",
-		exp: "/one/two",
-	}, {
-		in:  "/one//two",
-		exp: "/one/two",
-	}, {
-		in:  "/one/two/../three",
-		exp: "/one/three",
-	}}
-
-	for _, tc := range testCases {
-		want := tc.exp
-		got, err := tc.in.Canonical()
-		if err != nil {
-			t.Errorf("%q: unexpected error: %v", tc.in, err)
-		} else if want != got {
-			t.Errorf("%q: expected %q, got %q", tc.in, want, got)
-		}
-	}
-}
-
-func TestAbsPathJoin(t *testing.T) {
-	testCases := []struct {
-		base   absPath
-		more   []string
-		expect absPath
-	}{{
-		base:   "/dir",
-		more:   nil,
-		expect: "/dir",
-	}, {
-		base:   "/dir",
-		more:   []string{"one"},
-		expect: "/dir/one",
-	}, {
-		base:   "/dir",
-		more:   []string{"one", "two"},
-		expect: "/dir/one/two",
-	}, {
-		base:   "/dir",
-		more:   []string{"one", "two", "three"},
-		expect: "/dir/one/two/three",
-	}, {
-		base:   "/dir",
-		more:   []string{"with/slash"},
-		expect: "/dir/with/slash",
-	}, {
-		base:   "/dir",
-		more:   []string{"with/trailingslash/"},
-		expect: "/dir/with/trailingslash",
-	}, {
-		base:   "/dir",
-		more:   []string{"with//twoslash"},
-		expect: "/dir/with/twoslash",
-	}, {
-		base:   "/dir",
-		more:   []string{"one/1", "two/2", "three/3"},
-		expect: "/dir/one/1/two/2/three/3",
-	}}
-
-	for _, tc := range testCases {
-		if want, got := tc.expect, tc.base.Join(tc.more...); want != got {
-			t.Errorf("(%q, %q): expected %q, got %q", tc.base, tc.more, want, got)
-		}
-	}
-}
-
-func TestAbsPathSplit(t *testing.T) {
-	testCases := []struct {
-		in      absPath
-		expDir  string
-		expBase string
-	}{{
-		in:      "",
-		expDir:  "",
-		expBase: "",
-	}, {
-		in:      "/",
-		expDir:  "/",
-		expBase: "",
-	}, {
-		in:      "//",
-		expDir:  "/",
-		expBase: "",
-	}, {
-		in:      "/one",
-		expDir:  "/",
-		expBase: "one",
-	}, {
-		in:      "/one/two",
-		expDir:  "/one",
-		expBase: "two",
-	}, {
-		in:      "/one/two/",
-		expDir:  "/one",
-		expBase: "two",
-	}, {
-		in:      "/one//two",
-		expDir:  "/one",
-		expBase: "two",
-	}}
-
-	for _, tc := range testCases {
-		wantDir, wantBase := tc.expDir, tc.expBase
-		if gotDir, gotBase := tc.in.Split(); wantDir != gotDir || wantBase != gotBase {
-			t.Errorf("%q: expected (%q, %q), got (%q, %q)", tc.in, wantDir, wantBase, gotDir, gotBase)
-		}
-	}
-}
-
-func TestAbsPathDir(t *testing.T) {
-	testCases := []struct {
-		in  absPath
-		exp string
-	}{{
-		in:  "",
-		exp: "",
-	}, {
-		in:  "/",
-		exp: "/",
-	}, {
-		in:  "/one",
-		exp: "/",
-	}, {
-		in:  "/one/two",
-		exp: "/one",
-	}, {
-		in:  "/one/two/",
-		exp: "/one",
-	}, {
-		in:  "/one//two",
-		exp: "/one",
-	}}
-
-	for _, tc := range testCases {
-		if want, got := tc.exp, tc.in.Dir(); want != got {
-			t.Errorf("%q: expected %q, got %q", tc.in, want, got)
-		}
-	}
-}
-
-func TestAbsPathBase(t *testing.T) {
-	testCases := []struct {
-		in  absPath
-		exp string
-	}{{
-		in:  "",
-		exp: "",
-	}, {
-		in:  "/",
-		exp: "",
-	}, {
-		in:  "/one",
-		exp: "one",
-	}, {
-		in:  "/one/two",
-		exp: "two",
-	}, {
-		in:  "/one/two/",
-		exp: "two",
-	}, {
-		in:  "/one//two",
-		exp: "two",
-	}}
-
-	for _, tc := range testCases {
-		if want, got := tc.exp, tc.in.Base(); want != got {
-			t.Errorf("%q: expected %q, got %q", tc.in, want, got)
-		}
 	}
 }
 
@@ -747,7 +391,9 @@ func TestTouch(t *testing.T) {
 	stamp := time.Now()
 	time.Sleep(100 * time.Millisecond)
 
-	touch(dirPath)
+	if err := touch(dirPath); err != nil {
+		t.Fatalf("touch(dir) failed: %v", err)
+	}
 	if dirInfo, err := os.Stat(dirPath.String()); err != nil {
 		t.Fatalf("can't stat dir: %v", err)
 	} else if !dirInfo.IsDir() {
@@ -756,7 +402,9 @@ func TestTouch(t *testing.T) {
 		t.Errorf("touch(dir) mtime %v is not after %v", dirInfo.ModTime(), stamp)
 	}
 
-	touch(filePath)
+	if err := touch(filePath); err != nil {
+		t.Fatalf("touch(file) failed: %v", err)
+	}
 	if fileInfo, err := os.Stat(filePath.String()); err != nil {
 		t.Fatalf("can't stat file: %v", err)
 	} else if fileInfo.IsDir() {
@@ -765,12 +413,54 @@ func TestTouch(t *testing.T) {
 		t.Errorf("touch(file) mtime %v is not after %v", fileInfo.ModTime(), stamp)
 	}
 
-	touch(newfilePath)
+	if err := touch(newfilePath); err != nil {
+		t.Fatalf("touch(newfile) failed: %v", err)
+	}
 	if newfileInfo, err := os.Stat(newfilePath.String()); err != nil {
 		t.Fatalf("can't stat newfile: %v", err)
 	} else if newfileInfo.IsDir() {
 		t.Errorf("touch(newfile) is not a file: %v", newfileInfo)
 	} else if !newfileInfo.ModTime().After(stamp) {
 		t.Errorf("touch(newfile) mtime %v is not after %v", newfileInfo.ModTime(), stamp)
+	}
+}
+
+func TestHasGitLockFile(t *testing.T) {
+	testCases := map[string]struct {
+		inputFilePath  []string
+		expectLockFile bool
+	}{
+		"missing .git directory": {
+			expectLockFile: false,
+		},
+		"has git directory but no lock files": {
+			inputFilePath:  []string{".git", "HEAD"},
+			expectLockFile: false,
+		},
+		"shallow.lock file": {
+			inputFilePath:  []string{".git", "shallow.lock"},
+			expectLockFile: true,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			root := absPath(t.TempDir())
+
+			if len(tc.inputFilePath) > 0 {
+				if err := touch(root.Join(tc.inputFilePath...)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			lockFile, err := hasGitLockFile(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hasLock := len(lockFile) > 0
+			if hasLock != tc.expectLockFile {
+				t.Fatalf("expected hasGitLockFile to return %v, but got %v", tc.expectLockFile, hasLock)
+			}
+		})
 	}
 }

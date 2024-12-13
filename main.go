@@ -21,6 +21,7 @@ package main // import "k8s.io/git-sync/cmd/git-sync"
 import (
 	"context"
 	"crypto/md5"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -40,6 +41,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/pflag"
@@ -71,6 +73,11 @@ var (
 		Name: "git_sync_askpass_calls",
 		Help: "How many git askpass calls completed, partitioned by state (success, error)",
 	}, []string{"status"})
+
+	metricRefreshGitHubAppTokenCount = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "git_sync_refresh_github_app_token_count",
+		Help: "How many times the GitHub app token was refreshed, partitioned by state (success, error)",
+	}, []string{"status"})
 )
 
 func init() {
@@ -78,6 +85,7 @@ func init() {
 	prometheus.MustRegister(metricSyncCount)
 	prometheus.MustRegister(metricFetchCount)
 	prometheus.MustRegister(metricAskpassCount)
+	prometheus.MustRegister(metricRefreshGitHubAppTokenCount)
 }
 
 const (
@@ -105,221 +113,23 @@ const (
 
 const defaultDirMode = os.FileMode(0775) // subject to umask
 
-func envString(def string, key string, alts ...string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
-	}
-	for _, alt := range alts {
-		if val := os.Getenv(alt); val != "" {
-			fmt.Fprintf(os.Stderr, "env %s has been deprecated, use %s instead\n", alt, key)
-			return val
-		}
-	}
-	return def
-}
-
-func envBoolOrError(def bool, key string, alts ...string) (bool, error) {
-	parse := func(val string) (bool, error) {
-		parsed, err := strconv.ParseBool(val)
-		if err == nil {
-			return parsed, nil
-		}
-		return false, fmt.Errorf("ERROR: invalid bool env %s=%q: %v\n", key, val, err)
-	}
-
-	if val := os.Getenv(key); val != "" {
-		return parse(val)
-	}
-	for _, alt := range alts {
-		if val := os.Getenv(key); val != "" {
-			fmt.Fprintf(os.Stderr, "env %s has been deprecated, use %s instead\n", alt, key)
-			return parse(val)
-		}
-	}
-	return def, nil
-}
-func envBool(def bool, key string, alts ...string) bool {
-	val, err := envBoolOrError(def, key, alts...)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-		return false
-	}
-	return val
-}
-
-func envIntOrError(def int, key string, alts ...string) (int, error) {
-	parse := func(val string) (int, error) {
-		parsed, err := strconv.ParseInt(val, 0, 0)
-		if err == nil {
-			return int(parsed), nil
-		}
-		return 0, fmt.Errorf("ERROR: invalid int env %s=%q: %v\n", key, val, err)
-	}
-
-	if val := os.Getenv(key); val != "" {
-		return parse(val)
-	}
-	for _, alt := range alts {
-		if val := os.Getenv(key); val != "" {
-			fmt.Fprintf(os.Stderr, "env %s has been deprecated, use %s instead\n", alt, key)
-			return parse(val)
-		}
-	}
-	return def, nil
-}
-func envInt(def int, key string, alts ...string) int {
-	val, err := envIntOrError(def, key, alts...)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-		return 0
-	}
-	return val
-}
-
-func envFloatOrError(def float64, key string, alts ...string) (float64, error) {
-	parse := func(val string) (float64, error) {
-		parsed, err := strconv.ParseFloat(val, 64)
-		if err == nil {
-			return parsed, nil
-		}
-		return 0, fmt.Errorf("ERROR: invalid float env %s=%q: %v\n", key, val, err)
-	}
-
-	if val := os.Getenv(key); val != "" {
-		return parse(val)
-	}
-	for _, alt := range alts {
-		if val := os.Getenv(key); val != "" {
-			fmt.Fprintf(os.Stderr, "env %s has been deprecated, use %s instead\n", alt, key)
-			return parse(val)
-		}
-	}
-	return def, nil
-}
-func envFloat(def float64, key string, alts ...string) float64 {
-	val, err := envFloatOrError(def, key, alts...)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-		return 0
-	}
-	return val
-}
-
-func envDurationOrError(def time.Duration, key string, alts ...string) (time.Duration, error) {
-	parse := func(val string) (time.Duration, error) {
-		parsed, err := time.ParseDuration(val)
-		if err == nil {
-			return parsed, nil
-		}
-		return 0, fmt.Errorf("ERROR: invalid duration env %s=%q: %v\n", key, val, err)
-	}
-
-	if val := os.Getenv(key); val != "" {
-		return parse(val)
-	}
-	for _, alt := range alts {
-		if val := os.Getenv(key); val != "" {
-			fmt.Fprintf(os.Stderr, "env %s has been deprecated, use %s instead\n", alt, key)
-			return parse(val)
-		}
-	}
-	return def, nil
-}
-func envDuration(def time.Duration, key string, alts ...string) time.Duration {
-	val, err := envDurationOrError(def, key, alts...)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-		return 0
-	}
-	return val
-}
-
-// absPath is an absolute path string.  This type is intended to make it clear
-// when strings are absolute paths vs something else.  This does not verify or
-// mutate the input, so careless callers could make instances of this type that
-// are not actually absolute paths, or even "".
-type absPath string
-
-// String returns abs as a string.
-func (abs absPath) String() string {
-	return string(abs)
-}
-
-// Canonical returns a canonicalized form of abs, similar to filepath.Abs
-// (including filepath.Clean).  Unlike filepath.Clean, this preserves "" as a
-// special case.
-func (abs absPath) Canonical() (absPath, error) {
-	if abs == "" {
-		return abs, nil
-	}
-
-	result, err := filepath.Abs(abs.String())
-	if err != nil {
-		return "", err
-	}
-	return absPath(result), nil
-}
-
-// Join appends more path elements to abs, like filepath.Join.
-func (abs absPath) Join(elems ...string) absPath {
-	all := make([]string, 0, 1+len(elems))
-	all = append(all, abs.String())
-	all = append(all, elems...)
-	return absPath(filepath.Join(all...))
-}
-
-// Split breaks abs into stem and leaf parts (often directory and file, but not
-// necessarily), similar to filepath.Split.  Unlike filepath.Split, the
-// resulting stem part does not have any trailing path separators.
-func (abs absPath) Split() (string, string) {
-	if abs == "" {
-		return "", ""
-	}
-
-	// filepath.Split promises that dir+base == input, but trailing slashes on
-	// the dir is confusing and ugly.
-	pathSep := string(os.PathSeparator)
-	dir, base := filepath.Split(strings.TrimRight(abs.String(), pathSep))
-	dir = strings.TrimRight(dir, pathSep)
-	if len(dir) == 0 {
-		dir = string(os.PathSeparator)
-	}
-
-	return dir, base
-}
-
-// Dir returns the stem part of abs without the leaf, like filepath.Dir.
-func (abs absPath) Dir() string {
-	dir, _ := abs.Split()
-	return dir
-}
-
-// Base returns the leaf part of abs without the stem, like filepath.Base.
-func (abs absPath) Base() string {
-	_, base := abs.Split()
-	return base
-}
-
 // repoSync represents the remote repo and the local sync of it.
 type repoSync struct {
-	cmd          string         // the git command to run
-	root         absPath        // absolute path to the root directory
-	repo         string         // remote repo to sync
-	ref          string         // the ref to sync
-	depth        int            // for shallow sync
-	submodules   submodulesMode // how to handle submodules
-	gc           gcMode         // garbage collection
-	link         absPath        // absolute path to the symlink to publish
-	authURL      string         // a URL to re-fetch credentials, or ""
-	sparseFile   string         // path to a sparse-checkout file
-	syncCount    int            // how many times have we synced?
-	log          *logging.Logger
-	run          cmd.Runner
-	staleTimeout time.Duration // time for worktrees to be cleaned up
+	cmd            string         // the git command to run
+	root           absPath        // absolute path to the root directory
+	repo           string         // remote repo to sync
+	ref            string         // the ref to sync
+	depth          int            // for shallow sync
+	submodules     submodulesMode // how to handle submodules
+	gc             gcMode         // garbage collection
+	link           absPath        // absolute path to the symlink to publish
+	authURL        string         // a URL to re-fetch credentials, or ""
+	sparseFile     string         // path to a sparse-checkout file
+	syncCount      int            // how many times have we synced?
+	log            *logging.Logger
+	run            cmd.Runner
+	staleTimeout   time.Duration // time for worktrees to be cleaned up
+	appTokenExpiry time.Time     // time when github app auth token expires
 }
 
 func main() {
@@ -330,7 +140,7 @@ func main() {
 		if err == nil {
 			os.Exit(code)
 		}
-		fmt.Fprintf(os.Stderr, "ERROR: unhandled pid1 error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "FATAL: unhandled pid1 error: %v\n", err)
 		os.Exit(127)
 	}
 
@@ -340,9 +150,12 @@ func main() {
 
 	flVersion := pflag.Bool("version", false, "print the version and exit")
 	flHelp := pflag.BoolP("help", "h", false, "print help text and exit")
+	pflag.BoolVarP(flHelp, "__?", "?", false, "") // support -? as an alias to -h
+	mustMarkHidden("__?")
 	flManual := pflag.Bool("man", false, "print the full manual and exit")
 
-	flVerbose := pflag.IntP("verbose", "v", 0,
+	flVerbose := pflag.IntP("verbose", "v",
+		envInt(0, "GITSYNC_VERBOSE"),
 		"logs at this V level and lower will be printed")
 
 	flRepo := pflag.String("repo",
@@ -426,19 +239,17 @@ func main() {
 	flUsername := pflag.String("username",
 		envString("", "GITSYNC_USERNAME", "GIT_SYNC_USERNAME"),
 		"the username to use for git auth")
-	flPassword := pflag.String("password",
-		envString("", "GITSYNC_PASSWORD", "GIT_SYNC_PASSWORD"),
-		"the password or personal access token to use for git auth (prefer --password-file or this env var)")
+	flPassword := envFlagString("GITSYNC_PASSWORD", "",
+		"the password or personal access token to use for git auth",
+		"GIT_SYNC_PASSWORD")
 	flPasswordFile := pflag.String("password-file",
 		envString("", "GITSYNC_PASSWORD_FILE", "GIT_SYNC_PASSWORD_FILE"),
 		"the file from which the password or personal access token for git auth will be sourced")
+	flCredentials := pflagCredentialSlice("credential", envString("", "GITSYNC_CREDENTIAL"), "one or more credentials (see --man for details) available for authentication")
 
-	flSSH := pflag.Bool("ssh",
-		envBool(false, "GITSYNC_SSH", "GIT_SYNC_SSH"),
-		"use SSH for git operations")
-	flSSHKeyFile := pflag.String("ssh-key-file",
-		envString("/etc/git-secret/ssh", "GITSYNC_SSH_KEY_FILE", "GIT_SYNC_SSH_KEY_FILE", "GIT_SSH_KEY_FILE"),
-		"the SSH key to use")
+	flSSHKeyFiles := pflag.StringArray("ssh-key-file",
+		envStringArray("/etc/git-secret/ssh", "GITSYNC_SSH_KEY_FILE", "GIT_SYNC_SSH_KEY_FILE", "GIT_SSH_KEY_FILE"),
+		"the SSH key(s) to use")
 	flSSHKnownHosts := pflag.Bool("ssh-known-hosts",
 		envBool(true, "GITSYNC_SSH_KNOWN_HOSTS", "GIT_SYNC_KNOWN_HOSTS", "GIT_KNOWN_HOSTS"),
 		"enable SSH known_hosts verification")
@@ -453,6 +264,24 @@ func main() {
 	flAskPassURL := pflag.String("askpass-url",
 		envString("", "GITSYNC_ASKPASS_URL", "GIT_SYNC_ASKPASS_URL", "GIT_ASKPASS_URL"),
 		"a URL to query for git credentials (username=<value> and password=<value>)")
+
+	flGithubBaseURL := pflag.String("github-base-url",
+		envString("https://api.github.com/", "GITSYNC_GITHUB_BASE_URL"),
+		"the GitHub base URL to use when making requests to GitHub when using GitHub app auth")
+	flGithubAppPrivateKey := envFlagString("GITSYNC_GITHUB_APP_PRIVATE_KEY", "",
+		"the private key to use for GitHub app auth")
+	flGithubAppPrivateKeyFile := pflag.String("github-app-private-key-file",
+		envString("", "GITSYNC_GITHUB_APP_PRIVATE_KEY_FILE"),
+		"the file from which the private key for GitHub app auth will be sourced")
+	flGithubAppClientID := pflag.String("github-app-client-id",
+		envString("", "GITSYNC_GITHUB_APP_CLIENT_ID"),
+		"the GitHub app client ID to use for GitHub app auth")
+	flGithubAppApplicationID := pflag.Int("github-app-application-id",
+		envInt(0, "GITSYNC_GITHUB_APP_APPLICATION_ID"),
+		"the GitHub app application ID to use for GitHub app auth")
+	flGithubAppInstallationID := pflag.Int("github-app-installation-id",
+		envInt(0, "GITSYNC_GITHUB_APP_INSTALLATION_ID"),
+		"the GitHub app installation ID to use for GitHub app auth")
 
 	flGitCmd := pflag.String("git",
 		envString("git", "GITSYNC_GIT", "GIT_SYNC_GIT"),
@@ -477,31 +306,69 @@ func main() {
 	// Obsolete flags, kept for compat.
 	flDeprecatedBranch := pflag.String("branch", envString("", "GIT_SYNC_BRANCH"),
 		"DEPRECATED: use --ref instead")
-	pflag.CommandLine.MarkDeprecated("branch", "use --ref instead")
+	mustMarkDeprecated("branch", "use --ref instead")
+
 	flDeprecatedChmod := pflag.Int("change-permissions", envInt(0, "GIT_SYNC_PERMISSIONS"),
 		"DEPRECATED: use --group-write instead")
-	pflag.CommandLine.MarkDeprecated("change-permissions", "use --group-write instead")
+	mustMarkDeprecated("change-permissions", "use --group-write instead")
+
 	flDeprecatedDest := pflag.String("dest", envString("", "GIT_SYNC_DEST"),
 		"DEPRECATED: use --link instead")
-	pflag.CommandLine.MarkDeprecated("dest", "use --link instead")
+	mustMarkDeprecated("dest", "use --link instead")
+
 	flDeprecatedMaxSyncFailures := pflag.Int("max-sync-failures", envInt(0, "GIT_SYNC_MAX_SYNC_FAILURES"),
 		"DEPRECATED: use --max-failures instead")
-	pflag.CommandLine.MarkDeprecated("max-sync-failures", "use --max-failures instead")
+	mustMarkDeprecated("max-sync-failures", "use --max-failures instead")
+
+	flDeprecatedPassword := pflag.String("password", "", // the env vars are not deprecated
+		"DEPRECATED: use --password-file or $GITSYNC_PASSWORD instead")
+	mustMarkDeprecated("password", "use --password-file or $GITSYNC_PASSWORD instead")
+
 	flDeprecatedRev := pflag.String("rev", envString("", "GIT_SYNC_REV"),
 		"DEPRECATED: use --ref instead")
-	pflag.CommandLine.MarkDeprecated("rev", "use --ref instead")
+	mustMarkDeprecated("rev", "use --ref instead")
+
+	_ = pflag.Bool("ssh", false,
+		"DEPRECATED: this flag is no longer necessary")
+	mustMarkDeprecated("ssh", "no longer necessary")
+
 	flDeprecatedSyncHookCommand := pflag.String("sync-hook-command", envString("", "GIT_SYNC_HOOK_COMMAND"),
 		"DEPRECATED: use --exechook-command instead")
-	pflag.CommandLine.MarkDeprecated("sync-hook-command", "use --exechook-command instead")
+	mustMarkDeprecated("sync-hook-command", "use --exechook-command instead")
+
 	flDeprecatedTimeout := pflag.Int("timeout", envInt(0, "GIT_SYNC_TIMEOUT"),
 		"DEPRECATED: use --sync-timeout instead")
-	pflag.CommandLine.MarkDeprecated("timeout", "use --sync-timeout instead")
+	mustMarkDeprecated("timeout", "use --sync-timeout instead")
+
 	flDeprecatedV := pflag.Int("v", -1,
 		"DEPRECATED: use -v or --verbose instead")
-	pflag.CommandLine.MarkDeprecated("v", "use -v or --verbose instead")
+	mustMarkDeprecated("v", "use -v or --verbose instead")
+
 	flDeprecatedWait := pflag.Float64("wait", envFloat(0, "GIT_SYNC_WAIT"),
 		"DEPRECATED: use --period instead")
-	pflag.CommandLine.MarkDeprecated("wait", "use --period instead")
+	mustMarkDeprecated("wait", "use --period instead")
+
+	// For whatever reason pflag hardcodes stderr for the "usage" line when
+	// using the default FlagSet.  We tweak the output a bit anyway.
+	usage := func(out io.Writer, msg string) {
+		// When pflag parsing hits an error, it prints a message before and
+		// after the usage, which makes for nice reading.
+		if msg != "" {
+			fmt.Fprintln(out, msg)
+		}
+		fmt.Fprintf(out, "Usage: %s [FLAGS...]\n", filepath.Base(os.Args[0]))
+		fmt.Fprintln(out, "")
+		fmt.Fprintln(out, " FLAGS:")
+		pflag.CommandLine.SetOutput(out)
+		pflag.PrintDefaults()
+		fmt.Fprintln(out, "")
+		fmt.Fprintln(out, " ENVIRONMENT VARIABLES:")
+		printEnvFlags(out)
+		if msg != "" {
+			fmt.Fprintln(out, msg)
+		}
+	}
+	pflag.Usage = func() { usage(os.Stderr, "") }
 
 	//
 	// Parse and verify flags.  Errors here are fatal.
@@ -515,8 +382,7 @@ func main() {
 		os.Exit(0)
 	}
 	if *flHelp {
-		pflag.CommandLine.SetOutput(os.Stdout)
-		pflag.PrintDefaults()
+		usage(os.Stdout, "")
 		os.Exit(0)
 	}
 	if *flManual {
@@ -526,12 +392,12 @@ func main() {
 
 	// Make sure we have a root dir in which to work.
 	if *flRoot == "" {
-		fmt.Fprintf(os.Stderr, "ERROR: --root must be specified\n")
+		usage(os.Stderr, "required flag: --root must be specified")
 		os.Exit(1)
 	}
 	var absRoot absPath
 	if abs, err := absPath(*flRoot).Canonical(); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: can't absolutize --root: %v\n", err)
+		fmt.Fprintf(os.Stderr, "FATAL: can't absolutize --root: %v\n", err)
 		os.Exit(1)
 	} else {
 		absRoot = abs
@@ -544,43 +410,45 @@ func main() {
 	}
 	log := func() *logging.Logger {
 		dir, file := makeAbsPath(*flErrorFile, absRoot).Split()
-		return logging.New(dir, file, *flVerbose)
+		return logging.New(dir.String(), file, *flVerbose)
 	}()
 	cmdRunner := cmd.NewRunner(log)
 
 	if *flRepo == "" {
-		handleConfigError(log, true, "ERROR: --repo must be specified")
+		fatalConfigError(log, true, "required flag: --repo must be specified")
 	}
 
-	if *flDeprecatedBranch != "" && (*flDeprecatedRev == "" || *flDeprecatedRev == "HEAD") {
+	switch {
+	case *flDeprecatedBranch != "" && (*flDeprecatedRev == "" || *flDeprecatedRev == "HEAD"):
 		// Back-compat
 		log.V(0).Info("setting --ref from deprecated --branch")
 		*flRef = *flDeprecatedBranch
-	} else if *flDeprecatedRev != "" {
+	case *flDeprecatedRev != "" && *flDeprecatedBranch == "":
 		// Back-compat
 		log.V(0).Info("setting --ref from deprecated --rev")
 		*flRef = *flDeprecatedRev
-	} else if *flDeprecatedBranch != "" && *flDeprecatedRev != "" {
-		handleConfigError(log, true, "ERROR: can't set --ref from deprecated --branch and --rev")
+	case *flDeprecatedBranch != "" && *flDeprecatedRev != "":
+		fatalConfigError(log, true, "deprecated flag combo: can't set --ref from deprecated --branch and --rev (one or the other is OK)")
 	}
+
 	if *flRef == "" {
-		handleConfigError(log, true, "ERROR: --ref must be specified")
+		fatalConfigError(log, true, "required flag: --ref must be specified")
 	}
 
 	if *flDepth < 0 { // 0 means "no limit"
-		handleConfigError(log, true, "ERROR: --depth must be greater than or equal to 0")
+		fatalConfigError(log, true, "invalid flag: --depth must be greater than or equal to 0")
 	}
 
 	switch submodulesMode(*flSubmodules) {
 	case submodulesRecursive, submodulesShallow, submodulesOff:
 	default:
-		handleConfigError(log, true, "ERROR: --submodules must be one of %q, %q, or %q", submodulesRecursive, submodulesShallow, submodulesOff)
+		fatalConfigError(log, true, "invalid flag: --submodules must be one of %q, %q, or %q", submodulesRecursive, submodulesShallow, submodulesOff)
 	}
 
 	switch *flGitGC {
 	case gcAuto, gcAlways, gcAggressive, gcOff:
 	default:
-		handleConfigError(log, true, "ERROR: --git-gc must be one of %q, %q, %q, or %q", gcAuto, gcAlways, gcAggressive, gcOff)
+		fatalConfigError(log, true, "invalid flag: --git-gc must be one of %q, %q, %q, or %q", gcAuto, gcAlways, gcAggressive, gcOff)
 	}
 
 	if *flDeprecatedDest != "" {
@@ -599,11 +467,11 @@ func main() {
 		*flPeriod = time.Duration(int(*flDeprecatedWait*1000)) * time.Millisecond
 	}
 	if *flPeriod < 10*time.Millisecond {
-		handleConfigError(log, true, "ERROR: --period must be at least 10ms")
+		fatalConfigError(log, true, "invalid flag: --period must be at least 10ms")
 	}
 
 	if *flDeprecatedChmod != 0 {
-		handleConfigError(log, true, "ERROR: --change-permissions is no longer supported")
+		fatalConfigError(log, true, "deprecated flag: --change-permissions is no longer supported")
 	}
 
 	var syncSig syscall.Signal
@@ -620,7 +488,7 @@ func main() {
 			}
 		}
 		if syncSig == 0 {
-			handleConfigError(log, true, "ERROR: --sync-on-signal must be a valid signal name or number")
+			fatalConfigError(log, true, "invalid flag: --sync-on-signal must be a valid signal name or number")
 		}
 	}
 
@@ -630,7 +498,7 @@ func main() {
 		*flSyncTimeout = time.Duration(*flDeprecatedTimeout) * time.Second
 	}
 	if *flSyncTimeout < 10*time.Millisecond {
-		handleConfigError(log, true, "ERROR: --sync-timeout must be at least 10ms")
+		fatalConfigError(log, true, "invalid flag: --sync-timeout must be at least 10ms")
 	}
 
 	if *flDeprecatedMaxSyncFailures != 0 {
@@ -646,10 +514,10 @@ func main() {
 	}
 	if *flExechookCommand != "" {
 		if *flExechookTimeout < time.Second {
-			handleConfigError(log, true, "ERROR: --exechook-timeout must be at least 1s")
+			fatalConfigError(log, true, "invalid flag: --exechook-timeout must be at least 1s")
 		}
 		if *flExechookBackoff < time.Second {
-			handleConfigError(log, true, "ERROR: --exechook-backoff must be at least 1s")
+			fatalConfigError(log, true, "invalid flag: --exechook-backoff must be at least 1s")
 		}
 	}
 
@@ -659,57 +527,95 @@ func main() {
 			*flWebhookStatusSuccess = 0
 		}
 		if *flWebhookStatusSuccess < 0 {
-			handleConfigError(log, true, "ERROR: --webhook-success-status must be a valid HTTP code or 0")
+			fatalConfigError(log, true, "invalid flag: --webhook-success-status must be a valid HTTP code or 0")
 		}
 		if *flWebhookTimeout < time.Second {
-			handleConfigError(log, true, "ERROR: --webhook-timeout must be at least 1s")
+			fatalConfigError(log, true, "invalid flag: --webhook-timeout must be at least 1s")
 		}
 		if *flWebhookBackoff < time.Second {
-			handleConfigError(log, true, "ERROR: --webhook-backoff must be at least 1s")
+			fatalConfigError(log, true, "invalid flag: --webhook-backoff must be at least 1s")
 		}
 	}
 
-	if *flPassword != "" && *flPasswordFile != "" {
-		handleConfigError(log, true, "ERROR: only one of --password and --password-file may be specified")
+	if *flDeprecatedPassword != "" {
+		log.V(0).Info("setting $GITSYNC_PASSWORD from deprecated --password")
+		*flPassword = *flDeprecatedPassword
 	}
 	if *flUsername != "" {
 		if *flPassword == "" && *flPasswordFile == "" {
-			handleConfigError(log, true, "ERROR: --password or --password-file must be set when --username is specified")
+			fatalConfigError(log, true, "required flag: $GITSYNC_PASSWORD or --password-file must be specified when --username is specified")
+		}
+		if *flPassword != "" && *flPasswordFile != "" {
+			fatalConfigError(log, true, "invalid flag: only one of $GITSYNC_PASSWORD and --password-file may be specified")
+		}
+		if u, err := url.Parse(*flRepo); err == nil { // it may not even parse as a URL, that's OK
+			if u.User != nil {
+				fatalConfigError(log, true, "invalid flag: credentials may not be specified in --repo when --username is specified")
+			}
+		}
+	} else {
+		if *flPassword != "" {
+			fatalConfigError(log, true, "invalid flag: $GITSYNC_PASSWORD may only be specified when --username is specified")
+		}
+		if *flPasswordFile != "" {
+			fatalConfigError(log, true, "invalid flag: --password-file may only be specified when --username is specified")
 		}
 	}
 
-	if *flSSH {
+	if *flGithubAppApplicationID != 0 || *flGithubAppClientID != "" {
+		if *flGithubAppApplicationID != 0 && *flGithubAppClientID != "" {
+			fatalConfigError(log, true, "invalid flag: only one of --github-app-application-id or --github-app-client-id may be specified")
+		}
+		if *flGithubAppInstallationID == 0 {
+			fatalConfigError(log, true, "invalid flag: --github-app-installation-id must be specified when --github-app-application-id or --github-app-client-id are specified")
+		}
+		if *flGithubAppPrivateKey == "" && *flGithubAppPrivateKeyFile == "" {
+			fatalConfigError(log, true, "invalid flag: $GITSYNC_GITHUB_APP_PRIVATE_KEY or --github-app-private-key-file must be specified when --github-app-application-id or --github-app-client-id are specified")
+		}
+		if *flGithubAppPrivateKey != "" && *flGithubAppPrivateKeyFile != "" {
+			fatalConfigError(log, true, "invalid flag: only one of $GITSYNC_GITHUB_APP_PRIVATE_KEY or --github-app-private-key-file may be specified")
+		}
 		if *flUsername != "" {
-			handleConfigError(log, true, "ERROR: only one of --ssh and --username may be specified")
+			fatalConfigError(log, true, "invalid flag: --username may not be specified when --github-app-private-key-file is specified")
 		}
 		if *flPassword != "" {
-			handleConfigError(log, true, "ERROR: only one of --ssh and --password may be specified")
+			fatalConfigError(log, true, "invalid flag: --password may not be specified when --github-app-private-key-file is specified")
 		}
 		if *flPasswordFile != "" {
-			handleConfigError(log, true, "ERROR: only one of --ssh and --password-file may be specified")
+			fatalConfigError(log, true, "invalid flag: --password-file may not be specified when --github-app-private-key-file is specified")
 		}
-		if *flAskPassURL != "" {
-			handleConfigError(log, true, "ERROR: only one of --ssh and --askpass-url may be specified")
+	} else {
+		if *flGithubAppApplicationID != 0 {
+			fatalConfigError(log, true, "invalid flag: --github-app-application-id may only be specified when --github-app-private-key-file is specified")
 		}
-		if *flCookieFile {
-			handleConfigError(log, true, "ERROR: only one of --ssh and --cookie-file may be specified")
+		if *flGithubAppInstallationID != 0 {
+			fatalConfigError(log, true, "invalid flag: --github-app-installation-id may only be specified when --github-app-private-key-file is specified")
 		}
-		if *flSSHKeyFile == "" {
-			handleConfigError(log, true, "ERROR: --ssh-key-file must be specified when --ssh is set")
-		}
-		if *flSSHKnownHosts {
-			if *flSSHKnownHostsFile == "" {
-				handleConfigError(log, true, "ERROR: --ssh-known-hosts-file must be specified when --ssh-known-hosts is set")
+	}
+
+	if len(*flCredentials) > 0 {
+		for _, cred := range *flCredentials {
+			if cred.URL == "" {
+				fatalConfigError(log, true, "invalid flag: --credential URL must be specified")
+			}
+			if cred.Username == "" {
+				fatalConfigError(log, true, "invalid flag: --credential username must be specified")
+			}
+			if cred.Password == "" && cred.PasswordFile == "" {
+				fatalConfigError(log, true, "invalid flag: --credential password or password-file must be specified")
+			}
+			if cred.Password != "" && cred.PasswordFile != "" {
+				fatalConfigError(log, true, "invalid flag: only one of --credential password and password-file may be specified")
 			}
 		}
 	}
 
 	if *flHTTPBind == "" {
 		if *flHTTPMetrics {
-			handleConfigError(log, true, "ERROR: --http-bind must be specified when --http-metrics is set")
+			fatalConfigError(log, true, "required flag: --http-bind must be specified when --http-metrics is set")
 		}
 		if *flHTTPprof {
-			handleConfigError(log, true, "ERROR: --http-bind must be specified when --http-pprof is set")
+			fatalConfigError(log, true, "required flag: --http-bind must be specified when --http-pprof is set")
 		}
 	}
 
@@ -718,14 +624,15 @@ func main() {
 	//
 
 	log.V(0).Info("starting up",
+		"version", version.VERSION,
 		"pid", os.Getpid(),
 		"uid", os.Getuid(),
 		"gid", os.Getgid(),
 		"home", os.Getenv("HOME"),
-		"flags", logSafeFlags())
+		"flags", logSafeFlags(*flVerbose))
 
 	if _, err := exec.LookPath(*flGitCmd); err != nil {
-		log.Error(err, "ERROR: git executable not found", "git", *flGitCmd)
+		log.Error(err, "FATAL: git executable not found", "git", *flGitCmd)
 		os.Exit(1)
 	}
 
@@ -741,13 +648,13 @@ func main() {
 	// very early so that we can normalize the path even when there are
 	// symlinks in play.
 	if err := os.MkdirAll(absRoot.String(), defaultDirMode); err != nil {
-		log.Error(err, "ERROR: can't make root dir", "path", absRoot)
+		log.Error(err, "FATAL: can't make root dir", "path", absRoot)
 		os.Exit(1)
 	}
 	// Get rid of symlinks in the root path to avoid getting confused about
 	// them later.  The path must exist for EvalSymlinks to work.
 	if delinked, err := filepath.EvalSymlinks(absRoot.String()); err != nil {
-		log.Error(err, "ERROR: can't normalize root path", "path", absRoot)
+		log.Error(err, "FATAL: can't normalize root path", "path", absRoot)
 		os.Exit(1)
 	} else {
 		absRoot = absPath(delinked)
@@ -760,23 +667,39 @@ func main() {
 	absLink := makeAbsPath(*flLink, absRoot)
 	absTouchFile := makeAbsPath(*flTouchFile, absRoot)
 
-	if *flAddUser {
-		if err := addUser(); err != nil {
-			log.Error(err, "ERROR: can't add user")
-			os.Exit(1)
+	// Merge credential sources.
+	if *flUsername == "" {
+		// username and user@host URLs are validated as mutually exclusive
+		if u, err := url.Parse(*flRepo); err == nil { // it may not even parse as a URL, that's OK
+			// Note that `ssh://user@host/path` URLs need to retain the user
+			// field. Out of caution, we only handle HTTP(S) URLs here.
+			if u.User != nil && (u.Scheme == "http" || u.Scheme == "https") {
+				if user := u.User.Username(); user != "" {
+					*flUsername = user
+				}
+				if pass, found := u.User.Password(); found {
+					*flPassword = pass
+				}
+				u.User = nil
+				*flRepo = u.String()
+			}
 		}
 	}
+	if *flUsername != "" {
+		cred := credential{
+			URL:          *flRepo,
+			Username:     *flUsername,
+			Password:     *flPassword,
+			PasswordFile: *flPasswordFile,
+		}
+		*flCredentials = append([]credential{cred}, (*flCredentials)...)
+	}
 
-	// Don't pollute the user's .gitconfig if this is being run directly.
-	if f, err := os.CreateTemp("", "git-sync.gitconfig.*"); err != nil {
-		log.Error(err, "ERROR: can't create gitconfig file")
-		os.Exit(1)
-	} else {
-		gitConfig := f.Name()
-		f.Close()
-		os.Setenv("GIT_CONFIG_GLOBAL", gitConfig)
-		os.Setenv("GIT_CONFIG_NOSYSTEM", "true")
-		log.V(2).Info("created private gitconfig file", "path", gitConfig)
+	if *flAddUser {
+		if err := addUser(); err != nil {
+			log.Error(err, "FATAL: can't add user")
+			os.Exit(1)
+		}
 	}
 
 	// Capture the various git parameters.
@@ -800,28 +723,49 @@ func main() {
 	// no long-running operations like `git fetch`, so hopefully 30 seconds will be enough.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
+	// Log the git version.
+	if ver, _, err := cmdRunner.Run(ctx, "", nil, *flGitCmd, "version"); err != nil {
+		log.Error(err, "can't get git version")
+		os.Exit(1)
+	} else {
+		log.V(0).Info("git version", "version", ver)
+	}
+
+	// Don't pollute the user's .gitconfig if this is being run directly.
+	if f, err := os.CreateTemp("", "git-sync.gitconfig.*"); err != nil {
+		log.Error(err, "FATAL: can't create gitconfig file")
+		os.Exit(1)
+	} else {
+		gitConfig := f.Name()
+		f.Close()
+		os.Setenv("GIT_CONFIG_GLOBAL", gitConfig)
+		os.Setenv("GIT_CONFIG_NOSYSTEM", "true")
+		log.V(2).Info("created private gitconfig file", "path", gitConfig)
+	}
+
 	// Set various configs we want, but users might override.
 	if err := git.SetupDefaultGitConfigs(ctx); err != nil {
 		log.Error(err, "can't set default git configs")
 		os.Exit(1)
 	}
 
-	if *flUsername != "" {
-		if *flPasswordFile != "" {
-			passwordFileBytes, err := os.ReadFile(*flPasswordFile)
+	// Finish populating credentials.
+	for i := range *flCredentials {
+		cred := &(*flCredentials)[i]
+		if cred.PasswordFile != "" {
+			passwordFileBytes, err := os.ReadFile(cred.PasswordFile)
 			if err != nil {
-				log.Error(err, "can't read password file", "file", *flPasswordFile)
+				log.Error(err, "can't read password file", "file", cred.PasswordFile)
 				os.Exit(1)
 			}
-			*flPassword = string(passwordFileBytes)
+			cred.Password = string(passwordFileBytes)
 		}
 	}
 
-	if *flSSH {
-		if err := git.SetupGitSSH(*flSSHKnownHosts, *flSSHKeyFile, *flSSHKnownHostsFile); err != nil {
-			log.Error(err, "can't set up git SSH", "keyFile", *flSSHKeyFile, "knownHosts", *flSSHKnownHosts, "knownHostsFile", *flSSHKnownHostsFile)
-			os.Exit(1)
-		}
+	// If the --repo or any submodule uses SSH, we need to know which keys.
+	if err := git.SetupGitSSH(*flSSHKnownHosts, *flSSHKeyFiles, *flSSHKnownHostsFile); err != nil {
+		log.Error(err, "can't set up git SSH", "keyFiles", *flSSHKeyFiles, "useKnownHosts", *flSSHKnownHosts, "knownHostsFile", *flSSHKnownHostsFile)
+		os.Exit(1)
 	}
 
 	if *flCookieFile {
@@ -938,8 +882,8 @@ func main() {
 	// Craft a function that can be called to refresh credentials when needed.
 	refreshCreds := func(ctx context.Context) error {
 		// These should all be mutually-exclusive configs.
-		if *flUsername != "" {
-			if err := git.StoreCredentials(ctx, *flUsername, *flPassword); err != nil {
+		for _, cred := range *flCredentials {
+			if err := git.StoreCredentials(ctx, cred.URL, cred.Username, cred.Password); err != nil {
 				return err
 			}
 		}
@@ -952,11 +896,22 @@ func main() {
 			}
 			metricAskpassCount.WithLabelValues(metricKeySuccess).Inc()
 		}
+
+		if (*flGithubAppPrivateKeyFile != "" || *flGithubAppPrivateKey != "") && *flGithubAppInstallationID != 0 && (*flGithubAppApplicationID != 0 || *flGithubAppClientID != "") {
+			if git.appTokenExpiry.Before(time.Now().Add(30 * time.Second)) {
+				if err := git.RefreshGitHubAppToken(ctx, *flGithubBaseURL, *flGithubAppPrivateKey, *flGithubAppPrivateKeyFile, *flGithubAppClientID, *flGithubAppApplicationID, *flGithubAppInstallationID); err != nil {
+					metricRefreshGitHubAppTokenCount.WithLabelValues(metricKeyError).Inc()
+					return err
+				}
+				metricRefreshGitHubAppTokenCount.WithLabelValues(metricKeySuccess).Inc()
+			}
+		}
+
 		return nil
 	}
 
 	failCount := 0
-	firstLoop := true
+	syncCount := uint64(0)
 	for {
 		start := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), *flSyncTimeout)
@@ -974,7 +929,7 @@ func main() {
 			// this might have been called before, but also might not have
 			setRepoReady()
 			// We treat the first loop as a sync, including sending hooks.
-			if changed || firstLoop {
+			if changed || syncCount == 0 {
 				if absTouchFile != "" {
 					if err := touch(absTouchFile); err != nil {
 						log.Error(err, "failed to touch touch-file", "path", absTouchFile)
@@ -992,7 +947,7 @@ func main() {
 			} else {
 				updateSyncMetrics(metricKeyNoOp, start)
 			}
-			firstLoop = false
+			syncCount++
 
 			// Clean up old worktree(s) and run GC.
 			if err := git.cleanup(ctx); err != nil {
@@ -1021,10 +976,7 @@ func main() {
 				os.Exit(exitCode)
 			}
 
-			if isHash, err := git.IsKnownHash(ctx, git.ref); err != nil {
-				log.Error(err, "can't tell if ref is a git hash, exiting", "ref", git.ref)
-				os.Exit(1)
-			} else if isHash {
+			if hash == git.ref {
 				log.V(0).Info("ref appears to be a git hash, no further sync needed", "ref", git.ref)
 				log.DeleteErrorFile()
 				sleepForever()
@@ -1037,7 +989,7 @@ func main() {
 			log.DeleteErrorFile()
 		}
 
-		log.V(3).Info("next sync", "waitTime", flPeriod.String())
+		log.V(3).Info("next sync", "waitTime", flPeriod.String(), "syncCount", syncCount)
 		cancel()
 
 		// Sleep until the next sync. If syncSig is set then the sleep may
@@ -1049,6 +1001,26 @@ func main() {
 			log.V(1).Info("caught signal", "signal", unix.SignalName(syncSig))
 			t.Stop()
 		}
+	}
+}
+
+// mustMarkDeprecated is a helper around pflag.CommandLine.MarkDeprecated.
+// It panics if there is an error (as these indicate a coding issue).
+// This makes it easier to keep the linters happy.
+func mustMarkDeprecated(name string, usageMessage string) {
+	err := pflag.CommandLine.MarkDeprecated(name, usageMessage)
+	if err != nil {
+		panic(fmt.Sprintf("error marking flag %q as deprecated: %v", name, err))
+	}
+}
+
+// mustMarkHidden is a helper around pflag.CommandLine.MarkHidden.
+// It panics if there is an error (as these indicate a coding issue).
+// This makes it easier to keep the linters happy.
+func mustMarkHidden(name string) {
+	err := pflag.CommandLine.MarkHidden(name)
+	if err != nil {
+		panic(fmt.Sprintf("error marking flag %q as hidden: %v", name, err))
 	}
 }
 
@@ -1089,10 +1061,13 @@ const redactedString = "REDACTED"
 func redactURL(urlstr string) string {
 	u, err := url.Parse(urlstr)
 	if err != nil {
-		return err.Error()
+		// May be something like user@git.example.com:path/to/repo
+		return urlstr
 	}
 	if u.User != nil {
-		u.User = url.UserPassword(u.User.Username(), redactedString)
+		if _, found := u.User.Password(); found {
+			u.User = url.UserPassword(u.User.Username(), redactedString)
+		}
 	}
 	return u.String()
 }
@@ -1100,11 +1075,25 @@ func redactURL(urlstr string) string {
 // logSafeFlags makes sure any sensitive args (e.g. passwords) are redacted
 // before logging.  This returns a slice rather than a map so it is always
 // sorted.
-func logSafeFlags() []string {
+func logSafeFlags(v int) []string {
 	ret := []string{}
 	pflag.VisitAll(func(fl *pflag.Flag) {
+		// Don't log hidden flags
+		if fl.Hidden {
+			return
+		}
+		// Don't log unchanged values
+		if !fl.Changed && v <= 3 {
+			return
+		}
+
 		arg := fl.Name
 		val := fl.Value.String()
+
+		// Don't log empty, unchanged values
+		if val == "" && !fl.Changed && v < 6 {
+			return
+		}
 
 		// Handle --password
 		if arg == "password" {
@@ -1114,9 +1103,19 @@ func logSafeFlags() []string {
 		if arg == "repo" {
 			val = redactURL(val)
 		}
-		// Don't log empty values
-		if val == "" {
-			return
+		// Handle --credential
+		if arg == "credential" {
+			orig := fl.Value.(*credentialSliceValue)
+			sl := []credential{} // make a copy of the slice so we can mutate it
+			for _, cred := range orig.value {
+				if cred.Password != "" {
+					cred.Password = redactedString
+				}
+				sl = append(sl, cred)
+			}
+			tmp := *orig // make a copy
+			tmp.value = sl
+			val = tmp.String()
 		}
 
 		ret = append(ret, "--"+arg+"="+val)
@@ -1149,19 +1148,21 @@ func setRepoReady() {
 // it is deadlocked.
 func sleepForever() {
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, os.Kill)
+	signal.Notify(c, os.Interrupt)
 	<-c
 	os.Exit(0)
 }
 
-// handleConfigError prints the error to the standard error, prints the usage
+// fatalConfigError prints the error to the standard error, prints the usage
 // if the `printUsage` flag is true, exports the error to the error file and
 // exits the process with the exit code.
-func handleConfigError(log *logging.Logger, printUsage bool, format string, a ...interface{}) {
+func fatalConfigError(log *logging.Logger, printUsage bool, format string, a ...interface{}) {
 	s := fmt.Sprintf(format, a...)
 	fmt.Fprintln(os.Stderr, s)
 	if printUsage {
 		pflag.Usage()
+		// pflag prints flag errors both before and after usage
+		fmt.Fprintln(os.Stderr, s)
 	}
 	log.ExportError(s)
 	os.Exit(1)
@@ -1233,7 +1234,7 @@ func (git *repoSync) initRepo(ctx context.Context) error {
 			// the contents rather than the dir itself, because a common use-case
 			// is to have a volume mounted at git.root, which makes removing it
 			// impossible.
-			git.log.V(0).Info("repo directory failed checks or was empty", "path", git.root)
+			git.log.V(0).Info("repo directory was empty or failed checks", "path", git.root)
 			if err := removeDirContents(git.root, git.log); err != nil {
 				return fmt.Errorf("can't wipe unusable root directory: %w", err)
 			}
@@ -1295,6 +1296,20 @@ func (git *repoSync) removeStaleWorktrees() (int, error) {
 	return count, nil
 }
 
+func hasGitLockFile(gitRoot absPath) (string, error) {
+	gitLockFiles := []string{"shallow.lock"}
+	for _, lockFile := range gitLockFiles {
+		lockFilePath := gitRoot.Join(".git", lockFile).String()
+		_, err := os.Stat(lockFilePath)
+		if err == nil {
+			return lockFilePath, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return lockFilePath, err
+		}
+	}
+	return "", nil
+}
+
 // sanityCheckRepo tries to make sure that the repo dir is a valid git repository.
 func (git *repoSync) sanityCheckRepo(ctx context.Context) bool {
 	git.log.V(3).Info("sanity-checking git repo", "repo", git.root)
@@ -1326,6 +1341,16 @@ func (git *repoSync) sanityCheckRepo(ctx context.Context) bool {
 		return false
 	}
 
+	// Check if the repository contains an unreleased lock file. This can happen if
+	// a previous git invocation crashed.
+	if lockFile, err := hasGitLockFile(git.root); err != nil {
+		git.log.Error(err, "error calling stat on file", "path", lockFile)
+		return false
+	} else if len(lockFile) > 0 {
+		git.log.Error(nil, "repo contains lock file", "path", lockFile)
+		return false
+	}
+
 	return true
 }
 
@@ -1342,6 +1367,17 @@ func (git *repoSync) sanityCheckWorktree(ctx context.Context, worktree worktree)
 		return false
 	} else if empty {
 		git.log.V(0).Info("worktree is empty", "path", worktree.Path())
+		return false
+	}
+
+	// Make sure it is synced to the right commmit.
+	stdout, _, err := git.Run(ctx, worktree.Path(), "rev-parse", "HEAD")
+	if err != nil {
+		git.log.Error(err, "can't get worktree HEAD", "path", worktree.Path())
+		return false
+	}
+	if stdout != worktree.Hash() {
+		git.log.V(0).Info("worktree HEAD does not match worktree", "path", worktree.Path(), "head", stdout)
 		return false
 	}
 
@@ -1414,26 +1450,26 @@ func (git *repoSync) publishSymlink(ctx context.Context, worktree worktree) erro
 	linkDir, linkFile := git.link.Split()
 
 	// Make sure the link directory exists.
-	if err := os.MkdirAll(linkDir, defaultDirMode); err != nil {
-		return fmt.Errorf("error making symlink dir: %v", err)
+	if err := os.MkdirAll(linkDir.String(), defaultDirMode); err != nil {
+		return fmt.Errorf("error making symlink dir: %w", err)
 	}
 
-	// newDir is absolute, so we need to change it to a relative path.  This is
+	// linkDir is absolute, so we need to change it to a relative path.  This is
 	// so it can be volume-mounted at another path and the symlink still works.
-	targetRelative, err := filepath.Rel(linkDir, targetPath.String())
+	targetRelative, err := filepath.Rel(linkDir.String(), targetPath.String())
 	if err != nil {
-		return fmt.Errorf("error converting to relative path: %v", err)
+		return fmt.Errorf("error converting to relative path: %w", err)
 	}
 
 	const tmplink = "tmp-link"
 	git.log.V(2).Info("creating tmp symlink", "dir", linkDir, "link", tmplink, "target", targetRelative)
-	if err := os.Symlink(targetRelative, filepath.Join(linkDir, tmplink)); err != nil {
-		return fmt.Errorf("error creating symlink: %v", err)
+	if err := os.Symlink(targetRelative, filepath.Join(linkDir.String(), tmplink)); err != nil {
+		return fmt.Errorf("error creating symlink: %w", err)
 	}
 
 	git.log.V(2).Info("renaming symlink", "root", linkDir, "oldName", tmplink, "newName", linkFile)
-	if err := os.Rename(filepath.Join(linkDir, tmplink), git.link.String()); err != nil {
-		return fmt.Errorf("error replacing symlink: %v", err)
+	if err := os.Rename(filepath.Join(linkDir.String(), tmplink), git.link.String()); err != nil {
+		return fmt.Errorf("error replacing symlink: %w", err)
 	}
 
 	return nil
@@ -1451,7 +1487,7 @@ func (git *repoSync) removeWorktree(ctx context.Context, worktree worktree) erro
 	}
 	git.log.V(1).Info("removing worktree", "path", worktree.Path())
 	if err := os.RemoveAll(worktree.Path().String()); err != nil {
-		return fmt.Errorf("error removing directory: %v", err)
+		return fmt.Errorf("error removing directory: %w", err)
 	}
 	if _, _, err := git.Run(ctx, git.root, "worktree", "prune", "--verbose"); err != nil {
 		return err
@@ -1634,49 +1670,6 @@ func (m multiError) Error() string {
 	return strings.Join(strs, "; ")
 }
 
-// remoteHashForRef returns the upstream hash for a given ref.
-func (git *repoSync) remoteHashForRef(ctx context.Context, ref string) (string, error) {
-	// Fetch both the bare and dereferenced ref. git sorts the results and
-	// prints the dereferenced result, if present, after the bare result, so we
-	// always want the last result it produces.
-	output, _, err := git.Run(ctx, git.root, "ls-remote", "-q", git.repo, ref, ref+"^{}")
-	if err != nil {
-		return "", err
-	}
-	line := lastNonEmptyLine(output)
-	parts := strings.Split(line, "\t") // guaranteed to have at least 1 element
-	return parts[0], nil
-}
-
-func lastNonEmptyLine(text string) string {
-	lines := strings.Split(text, "\n") // guaranteed to have at least 1 element
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line != "" {
-			return line
-		}
-	}
-	return ""
-}
-
-// IsKnownHash returns true if ref is the hash of a commit which is known to this
-// repo.  In the event that ref is an abbreviated hash (e.g. "abcd" which
-// resolves to "abcdef1234567890"), this will return true by prefix-matching.
-// If ref is ambiguous, it will consider whatever result git returns.  If ref
-// is not a hash or is not known to this repo, even if it appears to be a hash,
-// this will return false.
-func (git *repoSync) IsKnownHash(ctx context.Context, ref string) (bool, error) {
-	stdout, stderr, err := git.Run(ctx, git.root, "rev-parse", ref+"^{commit}")
-	if err != nil {
-		if strings.Contains(stderr, "unknown revision") {
-			return false, nil
-		}
-		return false, err
-	}
-	line := lastNonEmptyLine(stdout)
-	return strings.HasPrefix(line, ref), nil
-}
-
 // worktree represents a git worktree (which may or may not exist on disk).
 type worktree absPath
 
@@ -1714,14 +1707,15 @@ func (git *repoSync) currentWorktree() (worktree, error) {
 	if filepath.IsAbs(target) {
 		return worktree(target), nil
 	}
-	return worktree(git.root.Join(target)), nil
+	linkDir, _ := git.link.Split()
+	return worktree(linkDir.Join(target)), nil
 }
 
 // SyncRepo syncs the repository to the desired ref, publishes it via the link,
 // and tries to clean up any detritus.  This function returns whether the
 // current hash has changed and what the new hash is.
 func (git *repoSync) SyncRepo(ctx context.Context, refreshCreds func(context.Context) error) (bool, string, error) {
-	git.log.V(3).Info("syncing", "repo", git.repo)
+	git.log.V(3).Info("syncing", "repo", redactURL(git.repo))
 
 	if err := refreshCreds(ctx); err != nil {
 		return false, "", fmt.Errorf("credential refresh failed: %w", err)
@@ -1732,26 +1726,6 @@ func (git *repoSync) SyncRepo(ctx context.Context, refreshCreds func(context.Con
 		return false, "", err
 	}
 
-	// Figure out what hash the remote resolves to.
-	remoteHash, err := git.remoteHashForRef(ctx, git.ref)
-	if err != nil {
-		return false, "", err
-	}
-
-	// If we couldn't find a remote commit, it might have been a hash literal.
-	if remoteHash == "" {
-		// If git thinks it tastes like a hash, we just use that and if it
-		// is wrong, we will fail later.
-		output, _, err := git.Run(ctx, git.root, "rev-parse", git.ref)
-		if err != nil {
-			return false, "", err
-		}
-		result := strings.Trim(output, "\n")
-		if result == git.ref {
-			remoteHash = git.ref
-		}
-	}
-
 	// Find out what we currently have synced, if anything.
 	var currentWorktree worktree
 	if wt, err := git.currentWorktree(); err != nil {
@@ -1760,7 +1734,23 @@ func (git *repoSync) SyncRepo(ctx context.Context, refreshCreds func(context.Con
 		currentWorktree = wt
 	}
 	currentHash := currentWorktree.Hash()
-	git.log.V(3).Info("current hash", "hash", currentHash)
+	git.log.V(3).Info("current state", "hash", currentHash, "worktree", currentWorktree)
+
+	// This should be very fast if we already have the hash we need. Parameters
+	// like depth are set at fetch time.
+	if err := git.fetch(ctx, git.ref); err != nil {
+		return false, "", err
+	}
+
+	// Figure out what we got.  The ^{} syntax "peels" annotated tags to
+	// their underlying commit hashes, but has no effect if we fetched a
+	// branch, plain tag, or hash.
+	remoteHash := ""
+	if output, _, err := git.Run(ctx, git.root, "rev-parse", "FETCH_HEAD^{}"); err != nil {
+		return false, "", err
+	} else {
+		remoteHash = strings.Trim(output, "\n")
+	}
 
 	if currentHash == remoteHash {
 		// We seem to have the right hash already.  Let's be sure it's good.
@@ -1783,17 +1773,12 @@ func (git *repoSync) SyncRepo(ctx context.Context, refreshCreds func(context.Con
 	// are set properly.  This is cheap when we already have the target hash.
 	if changed || git.syncCount == 0 {
 		git.log.V(0).Info("update required", "ref", git.ref, "local", currentHash, "remote", remoteHash, "syncCount", git.syncCount)
-
-		// Parameters like depth are set at fetch time.
-		if err := git.fetch(ctx, remoteHash); err != nil {
-			return false, "", err
-		}
 		metricFetchCount.Inc()
 
 		// Reset the repo (note: not the worktree - that happens later) to the new
 		// ref.  This makes subsequent fetches much less expensive.  It uses --soft
 		// so no files are checked out.
-		if _, _, err := git.Run(ctx, git.root, "reset", "--soft", "FETCH_HEAD"); err != nil {
+		if _, _, err := git.Run(ctx, git.root, "reset", "--soft", remoteHash); err != nil {
 			return false, "", err
 		}
 
@@ -1838,7 +1823,10 @@ func (git *repoSync) SyncRepo(ctx context.Context, refreshCreds func(context.Con
 		// Regular cleanup will happen in the outer loop, to catch stale
 		// worktrees.
 
-		if currentWorktree != git.worktreeFor(currentHash) {
+		// We can end up here with no current hash but (the expectation of) a
+		// current worktree (e.g. the hash was synced but the worktree does not
+		// exist).
+		if currentHash != "" && currentWorktree != git.worktreeFor(currentHash) {
 			// The old worktree might have come from a prior version, and so
 			// not get caught by the normal cleanup.
 			os.RemoveAll(currentWorktree.Path().String())
@@ -1852,7 +1840,7 @@ func (git *repoSync) SyncRepo(ctx context.Context, refreshCreds func(context.Con
 
 // fetch retrieves the specified ref from the upstream repo.
 func (git *repoSync) fetch(ctx context.Context, ref string) error {
-	git.log.V(1).Info("fetching", "ref", ref, "repo", git.repo)
+	git.log.V(2).Info("fetching", "ref", ref, "repo", redactURL(git.repo))
 
 	// Fetch the ref and do some cleanup, setting or un-setting the repo's
 	// shallow flag as appropriate.
@@ -1894,16 +1882,19 @@ func (git *repoSync) isShallow(ctx context.Context) (bool, error) {
 
 func md5sum(s string) string {
 	h := md5.New()
-	io.WriteString(h, s)
+	if _, err := io.WriteString(h, s); err != nil {
+		// Documented as never failing, so panic
+		panic(fmt.Sprintf("md5 WriteString failed: %v", err))
+	}
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-// StoreCredentials stores the username and password for later use.
-func (git *repoSync) StoreCredentials(ctx context.Context, username, password string) error {
-	git.log.V(1).Info("storing git credentials")
-	git.log.V(9).Info("md5 of credentials", "username", md5sum(username), "password", md5sum(password))
+// StoreCredentials stores a username and password for later use.
+func (git *repoSync) StoreCredentials(ctx context.Context, url, username, password string) error {
+	git.log.V(1).Info("storing git credential", "url", redactURL(url))
+	git.log.V(9).Info("md5 of credential", "url", url, "username", md5sum(username), "password", md5sum(password))
 
-	creds := fmt.Sprintf("url=%v\nusername=%v\npassword=%v\n", git.repo, username, password)
+	creds := fmt.Sprintf("url=%v\nusername=%v\npassword=%v\n", url, username, password)
 	_, _, err := git.RunWithStdin(ctx, "", creds, "credential", "approve")
 	if err != nil {
 		return fmt.Errorf("can't configure git credentials: %w", err)
@@ -1912,7 +1903,7 @@ func (git *repoSync) StoreCredentials(ctx context.Context, username, password st
 	return nil
 }
 
-func (git *repoSync) SetupGitSSH(setupKnownHosts bool, pathToSSHSecret, pathToSSHKnownHosts string) error {
+func (git *repoSync) SetupGitSSH(setupKnownHosts bool, pathsToSSHSecrets []string, pathToSSHKnownHosts string) error {
 	git.log.V(1).Info("setting up git SSH credentials")
 
 	// If the user sets GIT_SSH_COMMAND we try to respect it.
@@ -1921,21 +1912,29 @@ func (git *repoSync) SetupGitSSH(setupKnownHosts bool, pathToSSHSecret, pathToSS
 		sshCmd = "ssh"
 	}
 
-	if _, err := os.Stat(pathToSSHSecret); err != nil {
-		return fmt.Errorf("can't access SSH key file %s: %w", pathToSSHSecret, err)
+	// We can't pre-verify that key-files exist because we call this path
+	// without knowing whether we actually need SSH or not, in which case the
+	// files may not exist and that is OK.  But we can make SSH report more.
+	switch {
+	case git.log.V(9).Enabled():
+		sshCmd += " -vvv"
+	case git.log.V(7).Enabled():
+		sshCmd += " -vv"
+	case git.log.V(5).Enabled():
+		sshCmd += " -v"
 	}
-	sshCmd += fmt.Sprintf(" -i %s", pathToSSHSecret)
+
+	for _, p := range pathsToSSHSecrets {
+		sshCmd += fmt.Sprintf(" -i %s", p)
+	}
 
 	if setupKnownHosts {
-		if _, err := os.Stat(pathToSSHKnownHosts); err != nil {
-			return fmt.Errorf("can't access SSH known_hosts file %s: %w", pathToSSHKnownHosts, err)
-		}
 		sshCmd += fmt.Sprintf(" -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%s", pathToSSHKnownHosts)
 	} else {
-		sshCmd += fmt.Sprintf(" -o StrictHostKeyChecking=no")
+		sshCmd += " -o StrictHostKeyChecking=no"
 	}
 
-	git.log.V(9).Info("setting GIT_SSH_COMMAND", "value", sshCmd)
+	git.log.V(9).Info("setting $GIT_SSH_COMMAND", "value", sshCmd)
 	if err := os.Setenv("GIT_SSH_COMMAND", sshCmd); err != nil {
 		return fmt.Errorf("can't set $GIT_SSH_COMMAND: %w", err)
 	}
@@ -2015,7 +2014,95 @@ func (git *repoSync) CallAskPassURL(ctx context.Context) error {
 		}
 	}
 
-	if err := git.StoreCredentials(ctx, username, password); err != nil {
+	if err := git.StoreCredentials(ctx, git.repo, username, password); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// RefreshGitHubAppToken generates a new installation token for a GitHub app and stores it as a credential
+func (git *repoSync) RefreshGitHubAppToken(ctx context.Context, githubBaseURL, privateKey, privateKeyFile, clientID string, appID, installationID int) error {
+	git.log.V(3).Info("refreshing GitHub app token")
+
+	privateKeyBytes := []byte(privateKey)
+	if privateKey == "" {
+		b, err := os.ReadFile(privateKeyFile)
+		if err != nil {
+			git.log.Error(err, "can't read private key file", "file", privateKeyFile)
+			os.Exit(1)
+		}
+
+		privateKeyBytes = b
+	}
+
+	pkey, err := jwt.ParseRSAPrivateKeyFromPEM(privateKeyBytes)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now()
+
+	// either client ID or app ID can be used when minting JWTs
+	issuer := clientID
+	if issuer == "" {
+		issuer = strconv.Itoa(appID)
+	}
+
+	claims := jwt.RegisteredClaims{
+		Issuer:    issuer,
+		IssuedAt:  jwt.NewNumericDate(now),
+		ExpiresAt: jwt.NewNumericDate(now.Add(10 * time.Minute)),
+	}
+
+	jwt, err := jwt.NewWithClaims(jwt.SigningMethodRS256, claims).SignedString(pkey)
+	if err != nil {
+		return err
+	}
+
+	url, err := url.JoinPath(githubBaseURL, fmt.Sprintf("app/installations/%d/access_tokens", installationID))
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != 201 {
+		errMessage, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("GitHub app installation endpoint returned status %d, failed to read body: %w", resp.StatusCode, err)
+		}
+		return fmt.Errorf("GitHub app installation endpoint returned status %d, body: %q", resp.StatusCode, string(errMessage))
+	}
+
+	tokenResponse := struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}{}
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResponse); err != nil {
+		return err
+	}
+
+	git.appTokenExpiry = tokenResponse.ExpiresAt
+
+	// username must be non-empty
+	username := "-"
+	password := tokenResponse.Token
+
+	if err := git.StoreCredentials(ctx, git.repo, username, password); err != nil {
 		return err
 	}
 
@@ -2038,6 +2125,10 @@ func (git *repoSync) SetupDefaultGitConfigs(ctx context.Context) error {
 		key: "credential.helper",
 		val: "cache --timeout 3600",
 	}, {
+		// Never prompt for a password.
+		key: "core.askPass",
+		val: "true",
+	}, {
 		// Mark repos as safe (avoid a "dubious ownership" error).
 		key: "safe.directory",
 		val: "*",
@@ -2045,7 +2136,7 @@ func (git *repoSync) SetupDefaultGitConfigs(ctx context.Context) error {
 
 	for _, kv := range configs {
 		if _, _, err := git.Run(ctx, "", "config", "--global", kv.key, kv.val); err != nil {
-			return fmt.Errorf("error configuring git %q %q: %v", kv.key, kv.val, err)
+			return fmt.Errorf("error configuring git %q %q: %w", kv.key, kv.val, err)
 		}
 	}
 	return nil
@@ -2056,12 +2147,12 @@ func (git *repoSync) SetupDefaultGitConfigs(ctx context.Context) error {
 func (git *repoSync) SetupExtraGitConfigs(ctx context.Context, configsFlag string) error {
 	configs, err := parseGitConfigs(configsFlag)
 	if err != nil {
-		return fmt.Errorf("can't parse --git-config flag: %v", err)
+		return fmt.Errorf("can't parse --git-config flag: %w", err)
 	}
 	git.log.V(1).Info("setting additional git configs", "configs", configs)
 	for _, kv := range configs {
 		if _, _, err := git.Run(ctx, "", "config", "--global", kv.key, kv.val); err != nil {
-			return fmt.Errorf("error configuring additional git configs %q %q: %v", kv.key, kv.val, err)
+			return fmt.Errorf("error configuring additional git configs %q %q: %w", kv.key, kv.val, err)
 		}
 	}
 
@@ -2074,19 +2165,14 @@ type keyVal struct {
 }
 
 func parseGitConfigs(configsFlag string) ([]keyVal, error) {
-	ch := make(chan rune)
-	stop := make(chan bool)
+	// Use a channel as a FIFO.  We don't expect the input strings to be very
+	// large, so this simple model should suffice.
+	ch := make(chan rune, len(configsFlag))
 	go func() {
 		for _, r := range configsFlag {
-			select {
-			case <-stop:
-				break
-			default:
-				ch <- r
-			}
+			ch <- r
 		}
 		close(ch)
-		return
 	}()
 
 	result := []keyVal{}
@@ -2123,12 +2209,12 @@ func parseGitConfigs(configsFlag string) ([]keyVal, error) {
 			if r == '"' {
 				cur.val, err = parseGitConfigQVal(ch)
 				if err != nil {
-					return nil, fmt.Errorf("key %q: %v", cur.key, err)
+					return nil, fmt.Errorf("key %q: %w", cur.key, err)
 				}
 			} else {
 				cur.val, err = parseGitConfigVal(r, ch)
 				if err != nil {
-					return nil, fmt.Errorf("key %q: %v", cur.key, err)
+					return nil, fmt.Errorf("key %q: %w", cur.key, err)
 				}
 			}
 		}
@@ -2276,16 +2362,49 @@ DESCRIPTION
     git-sync can also be configured to make a webhook call upon successful git
     repo synchronization.  The call is made after the symlink is updated.
 
+CONTRACT
+
+    git-sync has two required flags:
+      --repo: specifies which remote git repo to sync
+      --root: specifies a working directory for git-sync
+
+    The root directory is not the synced data.
+
+    Inside the root directory, git-sync stores the synced git state and other
+    things.  That directory may or may not respond to git commands - it's an
+    implementation detail.
+
+    One of the things in that directory is a symlink (see the --link flag) to
+    the most recently synced data.  This is how the data is expected to be
+    consumed, and is considered to be the "contract" between git-sync and
+    consumers.  The exact target of that symlink is an implementation detail,
+    but the leaf component of the target (i.e. basename "$(readlink <link>)")
+    is the git hash of the synced revision.  This is also part of the contract.
+
+    Why the symlink?  git checkouts are not "atomic" operations.  If you look
+    at the repository while a checkout is happening, you might see data that is
+    neither exactly the old revision nor the new.  git-sync "publishes" updates
+    via the symlink to present an atomic interface to consumers.  When the
+    remote repo has changed, git-sync will fetch the data _without_ checking it
+    out, then create a new worktree, then change the symlink to point to that
+    new worktree.
+
+    git-sync looks for changes in the remote repo periodically (see the
+    --period flag) and will attempt to transfer as little data as possible and
+    use as little disk space as possible (see the --depth and --git-gc flags),
+    but this is not part of the contract.
+
 OPTIONS
 
     Many options can be specified as either a commandline flag or an environment
     variable, but flags are preferred because a misspelled flag is a fatal
-    error while a misspelled environment variable is silently ignored.
+    error while a misspelled environment variable is silently ignored.  Some
+    options can only be specified as an environment variable.
 
     --add-user, $GITSYNC_ADD_USER
             Add a record to /etc/passwd for the current UID/GID.  This is
-            needed to use SSH with an arbitrary UID (see --ssh).  This assumes
-            that /etc/passwd is writable by the current UID.
+            needed to use SSH with an arbitrary UID.  This assumes that
+            /etc/passwd is writable by the current UID.
 
     --askpass-url <string>, $GITSYNC_ASKPASS_URL
             A URL to query for git credentials.  The query must return success
@@ -2295,6 +2414,27 @@ OPTIONS
     --cookie-file <string>, $GITSYNC_COOKIE_FILE
             Use a git cookiefile (/etc/git-secret/cookie_file) for
             authentication.
+
+    --credential <string>, $GITSYNC_CREDENTIAL
+            Make one or more credentials available for authentication (see git
+            help credential).  This is similar to --username and
+            $GITSYNC_PASSWORD or --password-file, but for specific URLs, for
+            example when using submodules.  The value for this flag is either a
+            JSON-encoded object (see the schema below) or a JSON-encoded list
+            of that same object type.  This flag may be specified more than
+            once.
+
+            Object schema:
+              - url:            string, required
+              - username:       string, required
+              - password:       string, optional
+              - password-file:  string, optional
+
+            One of password or password-file must be specified.  Users should
+            prefer password-file for better security.
+
+            Example:
+              --credential='{"url":"https://github.com", "username":"myname", "password-file":"/creds/mypass"}'
 
     --depth <int>, $GITSYNC_DEPTH
             Create a shallow clone with history truncated to the specified
@@ -2361,6 +2501,29 @@ OPTIONS
             - off: Disable explicit git garbage collection, which may be a good
               fit when also using --one-time.
 
+    --github-base-url <string>, $GITSYNC_GITHUB_BASE_URL
+            The GitHub base URL to use in GitHub requests when GitHub app
+            authentication is used. If not specified, defaults to
+            https://api.github.com/.
+
+    --github-app-private-key-file <string>, $GITSYNC_GITHUB_APP_PRIVATE_KEY_FILE
+            The file from which the private key to use for GitHub app
+            authentication will be read.
+
+    --github-app-installation-id <int>, $GITSYNC_GITHUB_APP_INSTALLATION_ID
+            The installation ID of the GitHub app used for GitHub app
+            authentication.
+
+    --github-app-application-id <int>, $GITSYNC_GITHUB_APP_APPLICATION_ID
+            The app ID of the GitHub app used for GitHub app authentication.
+            One of --github-app-application-id or --github-app-client-id is required
+            when GitHub app authentication is used.
+
+    --github-app-client-id <int>, $GITSYNC_GITHUB_APP_CLIENT_ID
+            The client ID of the GitHub app used for GitHub app authentication.
+            One of --github-app-application-id or --github-app-client-id is required
+            when GitHub app authentication is used.
+
     --group-write, $GITSYNC_GROUP_WRITE
             Ensure that data written to disk (including the git repo metadata,
             checked out files, worktrees, and symlink) are all group writable.
@@ -2368,7 +2531,7 @@ OPTIONS
             useful in cases where data produced by git-sync is used by a
             different UID.  This replaces the older --change-permissions flag.
 
-    -h, --help
+    -?, -h, --help
             Print help text and exit.
 
     --http-bind <string>, $GITSYNC_HTTP_BIND
@@ -2411,16 +2574,14 @@ OPTIONS
     --one-time, $GITSYNC_ONE_TIME
             Exit after one sync.
 
-    --password <string>, $GITSYNC_PASSWORD
+    $GITSYNC_PASSWORD
             The password or personal access token (see github docs) to use for
-            git authentication (see --username).  NOTE: for security reasons,
-            users should prefer --password-file or $GITSYNC_PASSWORD_FILE for
-            specifying the password.
+            git authentication (see --username).  See also --password-file.
 
     --password-file <string>, $GITSYNC_PASSWORD_FILE
             The file from which the password or personal access token (see
             github docs) to use for git authentication (see --username) will be
-            read.
+            read.  See also $GITSYNC_PASSWORD.
 
     --period <duration>, $GITSYNC_PERIOD
             How long to wait between sync attempts.  This must be at least
@@ -2448,16 +2609,15 @@ OPTIONS
             details) which controls which files and directories will be checked
             out.  If not specified, the default is to check out the entire repo.
 
-    --ssh, $GITSYNC_SSH
-            Use SSH for git authentication and operations.
-
     --ssh-key-file <string>, $GITSYNC_SSH_KEY_FILE
-            The SSH key to use when using --ssh.  If not specified, this
-            defaults to "/etc/git-secret/ssh".
+            The SSH key(s) to use when using git over SSH.  This flag may be
+            specified more than once and the environment variable will be
+            parsed like PATH - using a colon (':') to separate elements.  If
+            not specified, this defaults to "/etc/git-secret/ssh".
 
     --ssh-known-hosts, $GITSYNC_SSH_KNOWN_HOSTS
-            Enable SSH known_hosts verification when using --ssh.  If not
-            specified, this defaults to true.
+            Enable SSH known_hosts verification when using git over SSH.  If
+            not specified, this defaults to true.
 
     --ssh-known-hosts-file <string>, $GITSYNC_SSH_KNOWN_HOSTS_FILE
             The known_hosts file to use when --ssh-known-hosts is specified.
@@ -2494,9 +2654,10 @@ OPTIONS
 
     --username <string>, $GITSYNC_USERNAME
             The username to use for git authentication (see --password-file or
-            --password).
+            $GITSYNC_PASSWORD).  If more than one username and password is
+            required (e.g. with submodules), use --credential.
 
-    -v, --verbose <int>
+    -v, --verbose <int>, $GITSYNC_VERBOSE
             Set the log verbosity level.  Logs at this level and lower will be
             printed.  Logs follow these guidelines:
 
@@ -2552,26 +2713,49 @@ AUTHENTICATION
     and "git@example.com:repo" will try to use SSH.
 
     username/password
-            The --username (GITSYNC_USERNAME) and --password-file
-            (GITSYNC_PASSWORD_FILE) or --password (GITSYNC_PASSWORD) flags
-            will be used.  To prevent password leaks, the --password-file flag
-            or GITSYNC_PASSWORD environment variable is almost always
-            preferred to the --password flag.
+            The --username ($GITSYNC_USERNAME) and $GITSYNC_PASSWORD or
+            --password-file ($GITSYNC_PASSWORD_FILE) flags will be used.  To
+            prevent password leaks, the --password-file flag or
+            $GITSYNC_PASSWORD environment variable is almost always preferred
+            to the --password flag, which is deprecated.
 
-            A variant of this is --askpass-url (GITSYNC_ASKPASS_URL), which
+            A variant of this is --askpass-url ($GITSYNC_ASKPASS_URL), which
             consults a URL (e.g. http://metadata) to get credentials on each
             sync.
 
+            When using submodules it may be necessary to specify more than one
+            username and password, which can be done with --credential
+            ($GITSYNC_CREDENTIAL).  All of the username+password pairs, from
+            both --username/$GITSYNC_PASSWORD and --credential are fed into
+            'git credential approve'.
+
     SSH
-            When --ssh (GITSYNC_SSH) is specified, the --ssh-key-file
-            (GITSYNC_SSH_KEY_FILE) will be used.  Users are strongly advised
-            to also use --ssh-known-hosts (GITSYNC_SSH_KNOWN_HOSTS) and
-            --ssh-known-hosts-file (GITSYNC_SSH_KNOWN_HOSTS_FILE) when using
-            SSH.
+            When an SSH transport is specified, the key(s) defined in
+            --ssh-key-file ($GITSYNC_SSH_KEY_FILE) will be used.  Users are
+            strongly advised to also use --ssh-known-hosts
+            ($GITSYNC_SSH_KNOWN_HOSTS) and --ssh-known-hosts-file
+            ($GITSYNC_SSH_KNOWN_HOSTS_FILE) when using SSH.
 
     cookies
-            When --cookie-file (GITSYNC_COOKIE_FILE) is specified, the
+            When --cookie-file ($GITSYNC_COOKIE_FILE) is specified, the
             associated cookies can contain authentication information.
+
+    github app
+           When --github-app-private-key-file ($GITSYNC_GITHUB_APP_PRIVATE_KEY_FILE),
+           --github-app-application-id ($GITSYNC_GITHUB_APP_APPLICATION_ID) or
+           --github-app-client-id ($GITSYNC_GITHUB_APP_CLIENT_ID)
+           and --github-app-installation_id ($GITSYNC_GITHUB_APP_INSTALLATION_ID)
+           are specified, GitHub app authentication will be used.
+
+           These credentials are used to request a short-lived token which
+           is used for authentication. The base URL of the GitHub request made
+           to retrieve the token can also be specified via
+           --github-base-url ($GITSYNC_GITHUB_BASE_URL), which defaults to
+           https://api.github.com/.
+
+           The GitHub app must have sufficient access to the repository to sync.
+           It should be installed to the repository or organization containing
+           the repository, and given read access (see github docs).
 
 HOOKS
 

@@ -45,13 +45,13 @@ ALL_PLATFORMS := linux/amd64 linux/arm linux/arm64 linux/ppc64le linux/s390x
 OS := $(if $(GOOS),$(GOOS),$(shell go env GOOS))
 ARCH := $(if $(GOARCH),$(GOARCH),$(shell go env GOARCH))
 
-BASEIMAGE ?= registry.k8s.io/build-image/debian-base:bookworm-v1.0.0
+BASEIMAGE ?= registry.k8s.io/build-image/debian-base:bookworm-v1.0.2
 
 IMAGE := $(REGISTRY)/$(BIN)
 TAG := $(VERSION)
 OS_ARCH_TAG := $(TAG)__$(OS)_$(ARCH)
 
-BUILD_IMAGE ?= golang:1.20-alpine
+BUILD_IMAGE ?= golang:1.22
 
 DBG_MAKEFILE ?=
 ifneq ($(DBG_MAKEFILE),1)
@@ -248,7 +248,7 @@ test: $(BUILD_DIRS)
 	    /bin/sh -c "                                           \
 	        ./build/test.sh ./...                              \
 	    "
-	./test_e2e.sh
+	VERBOSE=1 ./test_e2e.sh
 
 TEST_TOOLS := $(shell find _test_tools/* -type d -printf "%f ")
 test-tools: $(foreach tool, $(TEST_TOOLS), .container-test_tool.$(tool))
@@ -276,3 +276,20 @@ container-clean:
 
 bin-clean:
 	rm -rf .go bin
+
+lint-staticcheck:
+	go run honnef.co/go/tools/cmd/staticcheck@2023.1.3
+
+lint-golangci-lint:
+	go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.59.0 run
+
+lint-shellcheck:
+	docker run \
+	    --rm \
+	    -v `pwd`:`pwd` \
+	    -w `pwd` \
+	    docker.io/koalaman/shellcheck-alpine:v0.9.0 \
+	        shellcheck \
+	        $$(git ls-files ':!:vendor' '*.sh')
+
+lint: lint-staticcheck lint-golangci-lint lint-shellcheck
